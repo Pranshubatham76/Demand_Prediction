@@ -1,0 +1,257 @@
+================================================================
+        TRAFFIC DEMAND PREDICTION — SOLUTION APPROACH
+================================================================
+Author   : Pranshu Gupta
+Problem  : Traffic Demand Prediction
+Metric   : score = max(0, 100 * R²(actual, predicted))
+Target   : "demand" column  |  Submission size: 41778 × 2
+================================================================
+
+
+----------------------------------------------------------------
+PROBLEM UNDERSTANDING
+----------------------------------------------------------------
+The task is to predict traffic demand (a continuous value bounded
+in (0, 1]) at a given geographic location and timestamp, using
+road, weather, and spatial features. The evaluation metric is
+the coefficient of determination R², scaled to [0, 100].
+
+Input features available:
+  - geohash       : geographic location identifier
+  - day           : day of the week
+  - timestamp     : time of the record
+  - RoadType      : type of nearby road
+  - NumberofLanes : number of lanes at the location
+  - LargeVehicles : whether large vehicles are permitted
+  - Landmarks     : whether landmarks exist nearby
+  - Temperature   : temperature at the location
+  - Weather       : weather condition
+
+Target:
+  - demand        : traffic demand value at that timestamp
+
+
+----------------------------------------------------------------
+STEP 1 — IDENTIFY ALL UNKNOWN PARAMETERS (Θ)
+----------------------------------------------------------------
+Before building any model, I enumerate every parameter the
+model must learn. This is the full parameter set Θ:
+
+GROUP A — Embedding Parameters (Categorical → Dense Vectors):
+  E_geohash  ∈ ℝ^(1249 × 8)  =  9,992 parameters
+  E_roadtype ∈ ℝ^(3 × 3)     =      9 parameters
+  E_weather  ∈ ℝ^(4 × 2)     =      8 parameters
+  → These capture geographic and contextual identity
+    in a continuous representation space.
+
+GROUP B — Cyclic Temporal Encodings (Fixed, not learned):
+  hour_sin  = sin(2π·hour/24),  hour_cos  = cos(2π·hour/24)
+  min_sin   = sin(2π·min/60),   min_cos   = cos(2π·min/60)
+  day_sin   = sin(2π·day/7),    day_cos   = cos(2π·day/7)
+  → 6 deterministic transforms, 0 learnable parameters.
+    This preserves the cyclic nature of time (23:59 is
+    close to 00:00) without any extra learning cost.
+
+GROUP C — Dense Layer Parameters (Neural Backbone):
+  Architecture: [23 → 128 → 64 → 32 → 1]
+  W₁ ∈ ℝ^(23×128), W₂ ∈ ℝ^(128×64),
+  W₃ ∈ ℝ^(64×32),  W₄ ∈ ℝ^(32×1)
+  Total dense params: 13,441
+
+GROUP D — Regularization Hyperparameters:
+  λ₁ = L2 weight decay coefficient  (controls model complexity)
+  λ₂ = L1 sparsity coefficient      (promotes sparse weights)
+  δ  = Huber loss threshold         (boundary between L1 & L2)
+
+TOTAL LEARNABLE PARAMETERS |Θ| ≈ 23,450
+
+Why this matters: knowing |Θ| up front tells us whether we
+risk underfitting (too few params) or overfitting (too many
+params relative to 77,299 training samples).
+
+
+----------------------------------------------------------------
+STEP 2 — UNDERSTAND THE DATA DISTRIBUTION OF THE TARGET
+----------------------------------------------------------------
+Before choosing any loss function, we must understand what
+distribution the target variable "demand" comes from.
+(Choosing a loss before this step is a common mistake.)
+
+Empirical findings from the training data:
+  Min      ≈ 0.000000
+  Max      ≈ 1.000
+  Mean     ≈ small positive value
+  Skewness > 0  → right-skewed (most demand values are low,
+                   with occasional high-demand spikes)
+  Kurtosis > 0  → heavier tails than a Gaussian
+
+  Normality test (D'Agostino): REJECTED (p << 0.05)
+  → demand is NOT Gaussian distributed.
+
+  Log(demand) skewness ≈ near 0 after transformation
+  → demand follows an approximately log-normal distribution.
+
+Interpretation:
+  - Demand is always positive (bounded below at 0).
+  - Multiplicative effects (weather × road type × time of day)
+    govern demand, which is a hallmark of log-normal data.
+  - Predicting log(demand) instead of demand directly
+    stabilizes variance and linearizes the problem.
+
+Distribution decision:
+  Assume: demand ~ LogNormal(μ(x,Θ), σ²)
+  Predict: ŷ = log(demand) using our models,
+  then transform back: demand = exp(ŷ)
+
+
+----------------------------------------------------------------
+STEP 3 — DERIVE THE LOSS FUNCTION FROM THE DISTRIBUTION
+----------------------------------------------------------------
+The loss function is derived from the distribution assumption
+using Maximum Likelihood Estimation (MLE).
+
+If we get demand ~ LogNormal, then:
+  -log P(y | x, Θ) = MSE applied to log(y)
+  → We minimize MSE in log space.
+
+Full loss function (MAP perspective, with regularization):
+
+  L_total(Θ) = L_data(Θ) + L_regularization(Θ)
+
+Where:
+  L_data(Θ)           = (1/n) Σ [log(yᵢ) − ŷᵢ]²
+                        → MSE in log space (from MLE under
+                          log-normal assumption)
+
+  L_regularization(Θ) = λ₁·||Θ||²  +  λ₂·||Θ||₁
+                        → L2 (Gaussian prior) + L1 (Laplacian
+                          prior) on all model weights
+
+  (Huber loss was also considered as an alternative to MSE
+   when heavy-tailed residuals were observed in validation.)
+
+Connection to statistics:
+  MLE  →  minimize L_data(Θ)           (no prior on Θ)
+  MAP  →  minimize L_data(Θ) + L_reg(Θ) (prior on Θ)
+  L2 regularization = Gaussian prior on Θ
+  L1 regularization = Laplacian prior on Θ
+
+
+----------------------------------------------------------------
+STEP 4 — FEATURE ENGINEERING
+----------------------------------------------------------------
+Raw features were transformed to improve model learnability:
+
+Temporal features:
+  - Extracted hour and minute from timestamp.
+  - Applied cyclic (sin/cos) encoding to preserve the circular
+    nature of time: hour_sin, hour_cos, min_sin, min_cos,
+    day_sin, day_cos.
+  - Added time_minutes = total minutes since midnight.
+  - Added peak_hour binary flag (hour 8–12 = 1, else 0).
+
+Geographic features:
+  - geo_mean_demand : mean demand per full geohash location
+                      (target encoding from training data)
+  - geo_std_demand  : standard deviation of demand per geohash
+  - geo_l4_mean     : mean demand by first-4-character geohash
+                      prefix (broader geographic region)
+  - geo_l5_mean     : mean demand by first-5-character geohash
+                      prefix (mid-level geographic region)
+  → These hierarchical geo-features give the model spatial
+    context at multiple resolutions.
+
+Categorical encodings:
+  - RoadType and Weather were label-encoded to integers.
+  - LargeVehicles and Landmarks were binarized.
+
+Interaction terms:
+  - lanes_road_interact = NumberofLanes × RoadType_enc
+    (captures the combined effect of road type and capacity)
+
+Missing value handling:
+  - Temperature NaNs were imputed using median Temperature
+    grouped by Weather type (weather-conditional imputation).
+
+Final feature set (19 features):
+  hour_sin, hour_cos, min_sin, min_cos, day_sin, day_cos,
+  time_minutes, RoadType_enc, NumberofLanes, LargeVehicles_bin,
+  Landmarks_bin, Temperature, Weather_enc, geo_mean_demand,
+  geo_std_demand, geo_l4_mean, geo_l5_mean,
+  lanes_road_interact, peak_hour
+
+
+----------------------------------------------------------------
+STEP 5 — OPTIMIZATION: FINDING Θ* (MLE / MAP)
+----------------------------------------------------------------
+Two ensemble models were trained to minimize the derived loss:
+
+Model 1 — Random Forest Regressor (RF):
+  - Ensemble of decision trees, each trained on a bootstrap
+    sample with random feature subsets.
+  - Minimizes MSE in log space implicitly through averaging.
+  - Equivalent to a non-parametric MAP estimate with implicit
+    regularization via tree depth constraints.
+  - Parameters: n_estimators, max_depth, min_samples_leaf.
+
+Model 2 — Gradient Boosting Machine (GBM):
+  - Sequentially adds trees to minimize the negative gradient
+    of the loss function (functional gradient descent).
+  - Explicitly minimizes MSE in log space (our derived loss).
+  - L2 regularization controlled by learning_rate and
+    subsample (stochastic gradient boosting).
+
+Optimization procedure:
+  - Both models trained on log(demand) as the target.
+  - K-Fold cross-validation (KFold, k=5) used to evaluate
+    generalization and tune hyperparameters.
+  - This minimizes overfitting risk across 77,299 samples.
+
+Ensemble strategy:
+  Final prediction = 0.55 × RF_prediction
+                   + 0.45 × GBM_prediction  (in log space)
+  demand = exp(final_log_prediction)
+  demand = clip(demand, 1e-7, 1.0)
+
+  Weights were chosen to balance RF's stability (low variance)
+  with GBM's precision (low bias), validated on held-out folds.
+
+
+----------------------------------------------------------------
+STEP 6 — VALIDATION AND METRIC ALIGNMENT
+----------------------------------------------------------------
+Evaluation metric: score = max(0, 100 × R²(actual, predicted))
+
+R² is not the same as our training loss (MSE in log space).
+To ensure alignment:
+  - We validate R² directly on raw demand (after exp transform)
+    during cross-validation, not just training loss.
+  - Residual analysis was performed to check for systematic
+    bias in specific geohash zones or time windows.
+  - Prediction range verified: all values in (0, 1] as required.
+
+Cross-validation results confirmed that minimizing MSE in log
+space reliably improves R² on the original demand scale.
+
+----------------------------------------------------------------
+SUMMARY — THE MATHEMATICAL CHAIN
+----------------------------------------------------------------
+
+  DATA DISTRIBUTION (log-normal)
+        ↓
+  -log P(y | x, Θ)  →  LOSS = MSE on log(y) + Regularization
+        ↓
+  OPTIMIZATION  →  RF (bootstrap averaging) + GBM (grad descent)
+        ↓
+  PARAMETERS Θ*  →  learned embeddings, tree splits, leaf values
+        ↓
+  PREDICTIONS ŷ_log  →  demand = exp(ŷ_log)
+        ↓
+  R² SCORE on original demand scale  →  maximize
+
+Every step is a direct consequence of the one before it.
+The data distribution dictates the loss; the loss dictates the
+optimizer; the optimizer finds Θ*; Θ* generates predictions;
+predictions are evaluated by R².
+
+
